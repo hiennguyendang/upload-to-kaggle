@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 
@@ -65,6 +66,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rclone-retries", type=int, default=3)
     parser.add_argument("--rclone-backoff-sec", type=float, default=3.0)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="parallel threads for image resize+save (1 = serial)",
+    )
     return parser.parse_args()
 
 
@@ -84,6 +91,16 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
     )
 
 
+def _resize_and_save(record, config: PipelineConfig):
+    """CPU/IO-heavy part, safe to run in a thread (writes a unique file per image)."""
+    processed, width, height = preprocess_image(record.image_path, config.output_size)
+    out_dir = config.output_images_dir / record.patient_id / record.study_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_path = out_dir / f"{record.image_id}.png"
+    processed.save(output_path)
+    return width, height, output_path
+
+
 def process_one_pack(
     pack_name: str,
     local_pack_dir: Path,
@@ -91,6 +108,7 @@ def process_one_pack(
     processed_files: set[str],
     metadata_index: dict[str, dict],
     logger,
+    workers: int = 8,
 ) -> int:
     dimensions_path = config.processed_dir / "dimensions.jsonl"
     records = scan_pack_images(local_pack_dir, config)
@@ -100,42 +118,52 @@ def process_one_pack(
         records = records[: config.debug_max_images]
         logger.info("Debug mode for %s: process only first %d images", pack_name, len(records))
 
+    todo = [r for r in records if r.image_id not in processed_files]
     new_count = 0
-    for record in tqdm(records, desc=f"Processing {pack_name}"):
-        if record.image_id in processed_files:
-            continue
 
-        try:
-            processed, width, height = preprocess_image(record.image_path, config.output_size)
-            out_dir = config.output_images_dir / record.patient_id / record.study_id
-            out_dir.mkdir(parents=True, exist_ok=True)
-            output_path = out_dir / f"{record.image_id}.png"
-            processed.save(output_path)
-
-            metadata_index[record.image_id] = build_metadata_entry(
-                image_id=record.image_id,
-                patient_id=record.patient_id,
-                study_id=record.study_id,
-                output_path=output_path,
-            )
-
-            save_image_dimensions_jsonl(
-                dimensions_path=dimensions_path,
-                image_id=record.image_id,
-                patient_id=record.patient_id,
-                study_id=record.study_id,
-                width=width,
-                height=height,
-            )
-
-            processed_files.add(record.image_id)
-            new_count += 1
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Skip corrupt image %s: %s", record.image_path, exc)
-
-        if new_count > 0 and new_count % 200 == 0:
+    def _bookkeep(record, width, height, output_path) -> None:
+        # runs on the main thread only -> shared state stays consistent
+        nonlocal new_count
+        metadata_index[record.image_id] = build_metadata_entry(
+            image_id=record.image_id,
+            patient_id=record.patient_id,
+            study_id=record.study_id,
+            output_path=output_path,
+        )
+        save_image_dimensions_jsonl(
+            dimensions_path=dimensions_path,
+            image_id=record.image_id,
+            patient_id=record.patient_id,
+            study_id=record.study_id,
+            width=width,
+            height=height,
+        )
+        processed_files.add(record.image_id)
+        new_count += 1
+        if new_count % 200 == 0:
             save_string_set(config.processed_files_checkpoint, processed_files)
             save_metadata(config.metadata_path, list(metadata_index.values()))
+
+    if workers <= 1:
+        for record in tqdm(todo, desc=f"Processing {pack_name}"):
+            try:
+                width, height, output_path = _resize_and_save(record, config)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Skip corrupt image %s: %s", record.image_path, exc)
+                continue
+            _bookkeep(record, width, height, output_path)
+        return new_count
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_resize_and_save, r, config): r for r in todo}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc=f"Processing {pack_name}"):
+            record = futures[fut]
+            try:
+                width, height, output_path = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Skip corrupt image %s: %s", record.image_path, exc)
+                continue
+            _bookkeep(record, width, height, output_path)
 
     return new_count
 
@@ -147,6 +175,7 @@ def process_local_pack(
     processed_files: set[str],
     metadata_index: dict[str, dict],
     logger,
+    workers: int = 8,
 ) -> int:
     if not pack_dir.exists():
         raise FileNotFoundError(f"Local pack folder not found: {pack_dir}")
@@ -159,6 +188,7 @@ def process_local_pack(
         processed_files=processed_files,
         metadata_index=metadata_index,
         logger=logger,
+        workers=workers,
     )
 
 
@@ -225,6 +255,7 @@ def main() -> None:
                     processed_files=processed_files,
                     metadata_index=metadata_index,
                     logger=logger,
+                    workers=args.workers,
                 )
             else:
                 local_pack_dir, download_sec, speed_mb_s = run_rclone_copy(pack_name, config, logger)
@@ -242,6 +273,7 @@ def main() -> None:
                     processed_files=processed_files,
                     metadata_index=metadata_index,
                     logger=logger,
+                    workers=args.workers,
                 )
 
             total_new_images += new_images
